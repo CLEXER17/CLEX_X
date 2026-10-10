@@ -22,7 +22,9 @@ EVERYTHING ELSE is changed from Telegram (saved in DATA_DIR/settings.json, appli
     /delbreak <word>          remove a breaking keyword
     /status  /pause  /resume  /help
     /post                     post the best fresh story RIGHT NOW (ignores daily limits + review)
-    /say <text>               post your own text RIGHT NOW (max 280 chars)
+    /say <text>               post your own text RIGHT NOW (max 280 chars) with an auto image card
+    send a PHOTO with caption  /say <text>   -> posts YOUR image with that text
+    /sayt <text>              post text only, no image
     /menu                     show the button keyboard
     /golive  /dryrun          switch live / dry-run (go-live asks you to confirm)
 
@@ -33,6 +35,7 @@ Run:
     python x_bot.py review     # approve/edit/reject queued posts in terminal (optional)
 """
 
+import difflib
 import json
 import logging
 import os
@@ -115,10 +118,10 @@ SETTINGS = {
     "review_all": (False, "bool", None, None, "1 = approve every post yourself"),
     "review_expire_min": (180, "int", 10, 1440, "unreviewed items are dropped after this"),
     "tg_notify_posts": (True, "bool", None, None, "Telegram message for each live post"),
-    "cap_news": (99, "int", 0, 99, "news posts per day (non-breaking)"),
-    "cap_airdrop": (2, "int", 0, 99, "airdrop posts per day (non-breaking)"),
-    "cap_earnings": (2, "int", 0, 99, "earnings posts per day (non-breaking)"),
-    "cap_tech": (2, "int", 0, 99, "tech posts per day (non-breaking)"),
+    "cap_news": (99, "int", 0, 999, "news posts per day (non-breaking)"),
+    "cap_airdrop": (2, "int", 0, 999, "airdrop posts per day (non-breaking)"),
+    "cap_earnings": (2, "int", 0, 999, "earnings posts per day (non-breaking)"),
+    "cap_tech": (2, "int", 0, 999, "tech posts per day (non-breaking)"),
 }
 CATS = ("news", "airdrop", "earnings", "tech")
 DEFAULT_BREAKING = [
@@ -218,13 +221,26 @@ def settings_text():
     return "\n".join(lines)
 
 
+def settings_html():
+    """Every setting as its own tap-to-copy line: tap it, change the value, send it back. Several lines can be sent at once."""
+    raw = _settings_raw()
+    lines = ["SETTINGS - tap a line to copy it, change the value, send it. You can send several lines in one message.", ""]
+    for key, (default, *_rest) in SETTINGS.items():
+        tail = "" if key not in raw else f"  (default {html_escape(fmt_val(default))})"
+        lines.append(f"<code>{html_escape(f'/set {key} = {fmt_val(cfg(key))}')}</code>{tail}")
+    lines += ["", f"Breaking keywords: {len(breaking_keywords())}  -  <code>/breaking</code>"]
+    return "\n".join(lines)
+
+
 def apply_setting(kind, a, b):
     """Runs in the main thread. Returns the Telegram reply text."""
     data = dict(_settings_raw())
     if kind in ("set", "reset"):
         key = a
         if key not in SETTINGS:
-            return f"Unknown setting '{key}'. Send /settings to see all keys."
+            near = difflib.get_close_matches(key, list(SETTINGS), n=1, cutoff=0.6)
+            hint = f" Did you mean {near[0]}?" if near else ""
+            return f"❌ Unknown setting '{key}'.{hint}"
         if kind == "set":
             try:
                 val = parse_value(key, b or "")
@@ -272,14 +288,16 @@ def apply_setting(kind, a, b):
 
 HELP_TEXT = (
     "Commands:\n"
-    "/settings - show all settings\n"
-    "/set <key> <value> - change a setting (e.g. /set posts_per_day 4)\n"
+    "/settings - every setting as a tap-to-copy line; edit the value and send it back\n"
+    "/set <key> = <value> - change a setting (several lines in one message work)\n"
     "/reset <key> - back to default\n"
     "/breaking - list breaking keywords\n"
     "/addbreak <word> - add breaking keyword\n"
     "/delbreak <word> - remove breaking keyword\n"
     "/post - post the best fresh story NOW (ignores daily limits and review)\n"
-    "/say <text> - post your own text NOW\n"
+    "/say <text> - post your own text NOW (auto image card)\n"
+    "Photo + caption /say <text> - post YOUR image with your text\n"
+    "/sayt <text> - text only, no image\n"
     "/menu - show the buttons\n"
     "/golive  /dryrun - switch live / dry-run\n"
     "/status - today's counters\n"
@@ -880,6 +898,8 @@ def publish(text, title, cat, breaking, card_path, kind="regular"):
         log_post(r.data["id"], cat, text)
         if TG_ENABLED and cfg("tg_notify_posts"):
             tg_send(f"✅ Posted [{cat}{' BREAKING' if breaking else ''}]: https://x.com/i/status/{r.data['id']}")
+    if dry:   # dry-run drafts must not use up today's real posting slots
+        return
     state["count"] += 1
     if kind == "breaking":
         state["brk_count"] += 1
@@ -975,7 +995,7 @@ def run_post(breaking_only, force=False):
             if TG_ENABLED:
                 tg_send_review(q[-1])
             return None
-        _last["card"] = card
+        _last.update(card=card, cat=cat, title=item["title"], breaking=breaking)
         publish(text, item["title"], cat, breaking, card, kind=kind)
         return text
     log.info("No candidate passed the checks this run")
@@ -1109,15 +1129,74 @@ def tg_send(text, markup=None, html=False):
         tg("sendMessage", chat_id=TG_CHAT, text=text[:4000], disable_web_page_preview=True, **extra)
 
 
-def tg_draft_box(text, card=None):
-    """Dry-run draft (with its image) and a monospace '/say ...' box: tap the box to copy, send it to post this text once LIVE."""
-    body = ("🟡 DRY_RUN is on - nothing was posted.\nTap the box to copy, then send it to post exactly this text "
-            "(go LIVE first):\n\n<pre>" + html_escape("/say " + text) + "</pre>")
+def enqueue_draft(text, card, title, cat, breaking):
+    """Keep a dry-run draft in the review queue so it can be posted later (with its image) after going LIVE."""
+    q = load_json(QUEUE_FILE, [])
+    it = {"id": str(int(time.time() * 1000)), "text": text, "title": title, "cat": cat, "breaking": breaking,
+          "card": card, "t": time.time(), "scores": {}, "kind": "forced"}
+    q.append(it)
+    QUEUE_FILE.write_text(json.dumps(q, indent=2))
+    return it
+
+
+def tg_draft_box(text, card=None, item=None):
+    """Dry-run draft: image + monospace '/say ...' box (tap to copy) + Approve/Edit/Reject buttons that post THIS draft
+    (same image, same text) once you are LIVE."""
+    body = ("🟡 DRY_RUN is on - NOT posted yet.\n"
+            "To post THIS draft with its image: tap 🔴 Go LIVE, then ✅ Approve below.\n"
+            "Or tap the box to copy it for /say:\n\n<pre>" + html_escape("/say " + text) + "</pre>")
+    kb = None
+    if item:
+        kb = {"inline_keyboard": [[
+            {"text": "✅ Approve", "callback_data": f"a:{item['id']}"},
+            {"text": "✏️ Edit", "callback_data": f"e:{item['id']}"},
+            {"text": "❌ Reject", "callback_data": f"r:{item['id']}"},
+        ]]}
     if card and os.path.exists(card):
         with open(card, "rb") as f:
-            tg("sendPhoto", files={"photo": f}, chat_id=TG_CHAT, caption=body[:1024], parse_mode="HTML")
+            extra = {"reply_markup": json.dumps(kb)} if kb else {}
+            tg("sendPhoto", files={"photo": f}, chat_id=TG_CHAT, caption=body[:1024], parse_mode="HTML", **extra)
     else:
-        tg_send(body, html=True)
+        tg_send(body, kb, html=True)
+
+
+def tg_download_image(msg):
+    """Download the photo (or image file) of a Telegram message into DATA_DIR/cards. Returns the path or None."""
+    fid = None
+    if msg.get("photo"):
+        fid = msg["photo"][-1]["file_id"]            # largest size
+    elif msg.get("document") and str(msg["document"].get("mime_type", "")).startswith("image/"):
+        fid = msg["document"]["file_id"]
+    if not fid:
+        return None
+    fp = (tg("getFile", file_id=fid).get("result") or {}).get("file_path")
+    if not fp:
+        return None
+    try:
+        r = requests.get(f"https://api.telegram.org/file/bot{TG_TOKEN}/{fp}", timeout=60)
+        if r.status_code != 200 or len(r.content) > 5 * 1024 * 1024:   # X limit for post images: 5 MB
+            return None
+        path = CARDS_DIR / f"user_{int(time.time() * 1000)}{os.path.splitext(fp)[1] or '.jpg'}"
+        path.write_bytes(r.content)
+        return str(path)
+    except Exception as e:
+        log.warning("image download failed: %s", e)
+        return None
+
+
+def handle_photo_message(msg):
+    """A photo sent to the bot: caption '/say your text' posts it with that text."""
+    parts = (msg.get("caption") or "").strip().split(None, 1)
+    if not parts or parts[0].split("@")[0].lower() != "/say":
+        tg_send("To post your own image, send the photo with the caption:  /say your text")
+    elif len(parts) < 2:
+        tg_send("Add your text in the caption:  /say your text")
+    else:
+        path = tg_download_image(msg)
+        if path:
+            ACTIONS.put(("say", parts[1].strip(), path))
+        else:
+            tg_send("Couldn't use that image (send it as a photo or image file, max 5 MB).")
 
 
 def card_for_text(text):
@@ -1173,7 +1252,7 @@ def status_text():
     paused = KILL_FILE.exists()
     brk_cap = cfg("max_breaking_per_day")
     return (
-        f"Paused: {paused} | DRY_RUN: {cfg('dry_run')}\n"
+        f"Paused: {paused} | DRY_RUN: {cfg('dry_run')} | Approve every post: {cfg('review_all')}\n"
         f"Scheduled today: {st.get('reg_count', 0)}/{cfg('posts_per_day')}\n"
         f"Breaking today: {st.get('brk_count', 0)}/{brk_cap if brk_cap else 'no limit'}\n"
         f"Per category: {st.get('cat_counts', {})}\n"
@@ -1196,7 +1275,7 @@ def handle_command(text):
     elif cmd in ("/help", "/commands"):
         tg_send(HELP_TEXT)
     elif cmd == "/settings":
-        tg_send(settings_text())
+        tg_send(settings_html(), html=True)
     elif cmd == "/breaking":
         tg_send("Breaking keywords (these bypass the scheduled posts/day limit):\n" + ", ".join(breaking_keywords()))
     elif cmd == "/menu":
@@ -1205,6 +1284,8 @@ def handle_command(text):
         ACTIONS.put(("postnow", None, None))
     elif cmd == "/say":
         ACTIONS.put(("say", rest, None)) if rest else tg_send("Usage: /say <your post text>   (posts immediately, max 280 chars)")
+    elif cmd == "/sayt":
+        ACTIONS.put(("say", rest, "none")) if rest else tg_send("Usage: /sayt <text>   (posts text only, no image)")
     elif cmd == "/golive":
         tg("sendMessage", chat_id=TG_CHAT, text="Go LIVE? The bot will post to X for real.",
            reply_markup={"inline_keyboard": [[{"text": "✅ Yes, go LIVE", "callback_data": "c:live"},
@@ -1212,11 +1293,11 @@ def handle_command(text):
     elif cmd == "/dryrun":
         ACTIONS.put(("set", "dry_run", "1"))
     elif cmd == "/set":
-        parts = rest.split(None, 1)
-        if len(parts) < 2:
-            tg_send("Usage: /set <key> <value>   e.g. /set posts_per_day 4\nSend /settings to see all keys.")
+        m = re.match(r"^(\S+?)\s*[=:]\s*(.+)$", rest, re.S) or re.match(r"^(\S+)\s+(.+)$", rest, re.S)
+        if not m:
+            tg_send("Usage: /set key = value   e.g. /set posts_per_day = 4\nSend /settings to see all keys.")
         else:
-            ACTIONS.put(("set", parts[0].lower(), parts[1]))
+            ACTIONS.put(("set", m.group(1).lower(), m.group(2).strip()))
     elif cmd == "/reset":
         if not rest:
             tg_send("Usage: /reset <key>")
@@ -1229,6 +1310,23 @@ def handle_command(text):
     else:
         return False
     return True
+
+
+COMMAND_WORDS = {"/set", "/reset", "/say", "/sayt", "/post", "/status", "/pause", "/resume", "/settings", "/breaking",
+                 "/addbreak", "/delbreak", "/menu", "/golive", "/dryrun", "/help", "/commands"}
+
+
+def split_commands(text):
+    """One message may hold several commands, one per line. Lines that don't start a command belong to the
+    previous one, so a multi-line /say text stays in one piece."""
+    out = []
+    for line in text.split("\n"):
+        word = line.strip().split(None, 1)[0].split("@")[0].lower() if line.strip() else ""
+        if word in COMMAND_WORDS or not out:
+            out.append(line)
+        else:
+            out[-1] += "\n" + line
+    return [c.strip() for c in out if c.strip()]
 
 
 def tg_poll():
@@ -1262,6 +1360,9 @@ def tg_poll():
                         ACTIONS.put(("approve" if kind == "a" else "reject", qid, None))
                     continue
                 msg = u.get("message")
+                if msg and (msg.get("photo") or msg.get("document")) and str(msg["chat"]["id"]) == TG_CHAT:
+                    handle_photo_message(msg)
+                    continue
                 if not msg or not msg.get("text"):
                     continue
                 text = BUTTONS.get(msg["text"].strip(), msg["text"].strip())
@@ -1272,8 +1373,9 @@ def tg_poll():
                 if chat != TG_CHAT:
                     continue
                 if text.startswith("/"):
-                    if not handle_command(text):
-                        tg_send("Unknown command. Send /help")
+                    for one in split_commands(text):
+                        if not handle_command(one):
+                            tg_send("Unknown command. Send /help")
                 elif pending_edit:
                     ACTIONS.put(("edit", pending_edit, text))
                     pending_edit = None
@@ -1292,6 +1394,7 @@ def process_actions():
     if len(fresh) != len(q):
         QUEUE_FILE.write_text(json.dumps(fresh, indent=2))
         tg_send(f"⌛ Dropped {len(q) - len(fresh)} review item(s) older than {expire} min.")
+    replies = []
     while True:
         try:
             kind, qid, extra = ACTIONS.get_nowait()
@@ -1311,7 +1414,9 @@ def process_actions():
             if text is None:
                 tg_send("😕 No fresh story passed the checks right now. Try again in a few minutes, or use /say your own text.")
             elif cfg("dry_run"):
-                tg_draft_box(text, _last.get("card"))
+                tg_draft_box(text, _last.get("card"),
+                             enqueue_draft(text, _last.get("card"), _last.get("title", "manual /post"),
+                                           _last.get("cat", "news"), _last.get("breaking", False)))
             elif not cfg("tg_notify_posts"):
                 tg_send("✅ Posted:\n\n" + text)
             continue
@@ -1322,24 +1427,30 @@ def process_actions():
             elif not text or x_len(text) > 280:
                 tg_send(f"Text must be 1-280 characters (yours: {x_len(text)}; emoji and bold letters count double).")
             else:
-                card = card_for_text(text)
+                if extra == "none":
+                    card = None
+                elif extra and os.path.exists(extra):
+                    card = extra               # the photo you sent
+                else:
+                    card = card_for_text(text)
+                if cfg("dry_run"):
+                    tg_draft_box(text, card, enqueue_draft(text, card, "manual /say", "news", False))
+                    continue
                 try:
                     publish(text, "manual", "news", False, card, kind="forced")
                 except Exception as e:
                     log.exception("say failed: %s", e)
                     tg_send(f"❌ Post failed: {str(e)[:300]}")
                     continue
-                if cfg("dry_run"):
-                    tg_draft_box(text, card)
-                elif not cfg("tg_notify_posts"):
+                if not cfg("tg_notify_posts"):
                     tg_send("✅ Posted.")
             continue
         if kind in SETTING_ACTIONS:
             try:
-                tg_send(apply_setting(kind, qid, extra))
+                replies.append(apply_setting(kind, qid, extra))
             except Exception as e:
                 log.exception("settings change failed: %s", e)
-                tg_send(f"❌ Could not apply that: {e}")
+                replies.append(f"❌ Could not apply that: {e}")
             continue
         q = load_json(QUEUE_FILE, [])
         it = next((i for i in q if i["id"] == qid), None)
@@ -1361,10 +1472,14 @@ def process_actions():
                 tg_send("⏸ Bot is paused - /resume first. Item stays in the queue.")
                 tg_send_review(it)
                 continue
+            if cfg("dry_run"):   # keep the draft: approving in dry-run must not throw it away
+                tg_send("🟡 DRY_RUN is on - NOT posted. Tap 🔴 Go LIVE, then approve again. The draft stays in the queue.")
+                tg_send_review(it)
+                continue
             QUEUE_FILE.write_text(json.dumps([i for i in q if i["id"] != qid], indent=2))
             publish(it["text"], it["title"], it["cat"], it["breaking"], it.get("card"), kind=it.get("kind", "regular"))
-            if cfg("dry_run"):
-                tg_send("✅ Approved (DRY_RUN is on, nothing was posted to X).")
+    if replies:   # one message for a whole batch of /set lines
+        tg_send("\n\n".join(replies))
 
 
 # ---------- SCHEDULER ----------
@@ -1404,7 +1519,8 @@ def main():
             {"command": "addbreak", "description": "add breaking keyword"},
             {"command": "delbreak", "description": "remove breaking keyword"},
             {"command": "post", "description": "post best story now"},
-            {"command": "say", "description": "post your own text now"},
+            {"command": "say", "description": "post text now (+ image card)"},
+            {"command": "sayt", "description": "post text only, no image"},
             {"command": "menu", "description": "show buttons"},
             {"command": "golive", "description": "go live (asks to confirm)"},
             {"command": "dryrun", "description": "back to dry-run"},
