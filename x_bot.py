@@ -21,6 +21,10 @@ EVERYTHING ELSE is changed from Telegram (saved in DATA_DIR/settings.json, appli
     /addbreak <word>          add a breaking keyword
     /delbreak <word>          remove a breaking keyword
     /status  /pause  /resume  /help
+    /post                     post the best fresh story RIGHT NOW (ignores daily limits + review)
+    /say <text>               post your own text RIGHT NOW (max 280 chars)
+    /menu                     show the button keyboard
+    /golive  /dryrun          switch live / dry-run (go-live asks you to confirm)
 
 First start is DRY_RUN (nothing is posted). Go live with:  /set dry_run 0
 
@@ -48,7 +52,7 @@ import feedparser
 import requests
 import schedule
 import tweepy
-from anthropic import Anthropic
+from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
 
@@ -262,6 +266,10 @@ HELP_TEXT = (
     "/breaking - list breaking keywords\n"
     "/addbreak <word> - add breaking keyword\n"
     "/delbreak <word> - remove breaking keyword\n"
+    "/post - post the best fresh story NOW (ignores daily limits and review)\n"
+    "/say <text> - post your own text NOW\n"
+    "/menu - show the buttons\n"
+    "/golive  /dryrun - switch live / dry-run\n"
     "/status - today's counters\n"
     "/pause  /resume - stop / start all posting\n"
     "Go live: /set dry_run 0"
@@ -363,13 +371,36 @@ def roll_day(state):
 
 
 # ---------- CLAUDE ----------
+_alert_last = {}
+
+
+def alert_once(key, text, every_min=180):
+    """Telegram alert, repeated at most once per `every_min` so a broken key/credit never spams you."""
+    now = time.time()
+    if now - _alert_last.get(key, 0) < every_min * 60:
+        return
+    _alert_last[key] = now
+    log.error(text)
+    tg_send(text)
+
+
 def ask_claude(system, prompt, max_tokens=300):
-    r = claude.messages.create(
-        model=cfg("claude_model"),
-        max_tokens=max_tokens,
-        system=system,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        r = claude.messages.create(
+            model=cfg("claude_model"),
+            max_tokens=max_tokens,
+            system=system,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except APIStatusError as e:
+        msg = str(e).lower()
+        if e.status_code == 402 or "credit balance" in msg:
+            alert_once("claude_credit", "🚨 Claude API credits are finished - the bot cannot write posts until you add credits:\n"
+                                        "https://platform.claude.com/settings/billing")
+        elif e.status_code == 401:
+            alert_once("claude_auth", "🚨 Claude API key was rejected (invalid or deleted). Create a new key at "
+                                      "https://platform.claude.com and update ANTHROPIC_API_KEY in Railway.")
+        raise
     return "".join(b.text for b in r.content if b.type == "text").strip()
 
 
@@ -571,10 +602,10 @@ def make_card(headline, cat, breaking, out=None):
 def generate_post(item, breaking):
     cat = item["cat"]
     style = {
-        "news": "Lead with the key fact, then one short insight.",
+        "news": "Lead with the key fact. Add one short line of context ONLY if it is stated in the context. No opinions, advice or predictions.",
         "airdrop": "Say what the airdrop/launch is and what users should check (eligibility, snapshot, official channel). Warn to use only official links.",
         "earnings": "Lead with the key number/result from the headline, then one short takeaway.",
-        "tech": "Explain why this matters for crypto/tech in one or two lines.",
+        "tech": "State the key fact, then one line on why it matters, using only what the context says. No predictions.",
     }[cat]
     if breaking:
         style = "Lead with the key fact fast, urgent but factual."
@@ -710,30 +741,40 @@ def publish(text, title, cat, breaking, card_path, kind="regular"):
             log.warning("Image upload failed, posting text only: %s", e)
     log.info("POST [%s%s]: %s", cat, " BREAKING" if breaking else "", text)
     if not dry:
-        r = x.create_tweet(text=text, media_ids=media_ids)
+        try:
+            r = x.create_tweet(text=text, media_ids=media_ids)
+        except tweepy.errors.HTTPException as e:
+            if getattr(e.response, "status_code", None) == 402 or "credit" in str(e).lower():
+                alert_once("x_credit", "🚨 X API credits are finished - posting is blocked. Add credits at https://console.x.com")
+            raise
         log_post(r.data["id"], cat, text)
         if TG_ENABLED and cfg("tg_notify_posts"):
             tg_send(f"✅ Posted [{cat}{' BREAKING' if breaking else ''}]: https://x.com/i/status/{r.data['id']}")
     state["count"] += 1
-    state["brk_count" if kind == "breaking" else "reg_count"] += 1
-    state["cat_counts"][cat] = state["cat_counts"].get(cat, 0) + 1
+    if kind == "breaking":
+        state["brk_count"] += 1
+    elif kind == "regular":
+        state["reg_count"] += 1
+    if kind != "forced":   # /post and /say never use up scheduled / category slots
+        state["cat_counts"][cat] = state["cat_counts"].get(cat, 0) + 1
     save_state(state)
 
 
-def run_post(breaking_only):
+def run_post(breaking_only, force=False):
+    """force=True (/post): ignore daily limits, category caps and review. Returns the post text if one went out."""
     if killed():
-        return
+        return None
     state = load_state()
     roll_day(state)
     brk_cap = cfg("max_breaking_per_day")
     brk_full = brk_cap > 0 and state["brk_count"] >= brk_cap
     reg_full = state["reg_count"] >= cfg("posts_per_day")
-    if breaking_only and brk_full:
+    if not force and breaking_only and brk_full:
         log.info("Breaking cap reached (%d/day)", brk_cap)
-        return
-    if not breaking_only and reg_full:
+        return None
+    if not force and not breaking_only and reg_full:
         log.info("Scheduled posts done for today (%d)", cfg("posts_per_day"))
-        return
+        return None
     items = []
     for n in fetch_news():
         if not is_niche(n) or is_dup(n["title"], state["posted"]):
@@ -743,57 +784,60 @@ def run_post(breaking_only):
             continue
         # breaking stories bypass the category caps (and the scheduled posts/day limit)
         bypass = brk and not brk_full
-        if not bypass and state["cat_counts"].get(n["cat"], 0) >= cfg("cap_" + n["cat"]):
+        if not force and not bypass and state["cat_counts"].get(n["cat"], 0) >= cfg("cap_" + n["cat"]):
             continue
         items.append(n)
     if not items:
         log.info("No fresh %s item", "breaking" if breaking_only else "")
-        return
+        return None
     items.sort(key=lambda n: (not is_breaking(n["title"]), CAT_PRIORITY[n["cat"]], n["age"]))
-    item = items[0]
-    cat = item["cat"]
-    breaking = is_breaking(item["title"])
-    kind = "breaking" if (breaking and not brk_full) else "regular"
+    for item in items[:3]:   # try the best few candidates; stop at the first one that passes
+        cat = item["cat"]
+        breaking = is_breaking(item["title"])
+        kind = "forced" if force else ("breaking" if (breaking and not brk_full) else "regular")
 
-    # mark as seen first so a rejected/failed story is never retried every 10 minutes
-    state["posted"].append(item["title"])
-    save_state(state)
+        # mark as seen first so a rejected/failed story is never retried every 10 minutes
+        state["posted"].append(item["title"])
+        save_state(state)
 
-    text = generate_post(item, breaking)
-    if len(text) > 280:
-        text = ask_claude(PERSONA, f"Shorten to under 260 characters, keep hashtags:\n{text}")
-    if len(text) > 280:
-        log.warning("Post too long, skipping")
-        return
-    if not numbers_supported(text, item):
-        log.info("SKIP (number not in source): %s", text)
-        return
-    ok, scores = quality_check(item, text)
-    if not ok:
-        log.info("SKIP (quality %s): %s", scores, text)
-        return
-    if cat in DISCLAIMER_CATS and len(text) + 6 <= 280:
-        text += "\nDYOR"
+        text = generate_post(item, breaking)
+        if len(text) > 280:
+            text = ask_claude(PERSONA, f"Shorten to under 260 characters, keep hashtags:\n{text}")
+        if len(text) > 280:
+            log.warning("Post too long, skipping")
+            continue
+        if not numbers_supported(text, item):
+            log.info("SKIP (number not in source): %s", text)
+            continue
+        ok, scores = quality_check(item, text)
+        if not ok:
+            log.info("SKIP (quality %s): %s", scores, text)
+            continue
+        if cat in DISCLAIMER_CATS and len(text) + 6 <= 280:
+            text += "\nDYOR"
 
-    card = None
-    if cfg("use_image"):
-        try:
-            card = make_card(item.get("card", item["title"])[:150], cat, breaking,
-                             out=str(CARDS_DIR / f"{int(time.time())}.png"))
-        except Exception as e:
-            log.warning("Card failed, text only: %s", e)
+        card = None
+        if cfg("use_image"):
+            try:
+                card = make_card(item.get("card", item["title"])[:150], cat, breaking,
+                                 out=str(CARDS_DIR / f"{int(time.time())}.png"))
+            except Exception as e:
+                log.warning("Card failed, text only: %s", e)
 
-    if needs_review(cat):
-        q = load_json(QUEUE_FILE, [])
-        q.append({"id": str(int(time.time() * 1000)), "text": text, "title": item["title"],
-                  "cat": cat, "breaking": breaking, "card": card, "t": time.time(), "scores": scores,
-                  "kind": kind})
-        QUEUE_FILE.write_text(json.dumps(q, indent=2))
-        log.info("QUEUED for review [%s]: %s", cat, text)
-        if TG_ENABLED:
-            tg_send_review(q[-1])
-        return
-    publish(text, item["title"], cat, breaking, card, kind=kind)
+        if needs_review(cat) and not force:
+            q = load_json(QUEUE_FILE, [])
+            q.append({"id": str(int(time.time() * 1000)), "text": text, "title": item["title"],
+                      "cat": cat, "breaking": breaking, "card": card, "t": time.time(), "scores": scores,
+                      "kind": kind})
+            QUEUE_FILE.write_text(json.dumps(q, indent=2))
+            log.info("QUEUED for review [%s]: %s", cat, text)
+            if TG_ENABLED:
+                tg_send_review(q[-1])
+            return None
+        publish(text, item["title"], cat, breaking, card, kind=kind)
+        return text
+    log.info("No candidate passed the checks this run")
+    return None
 
 
 def review_cli():
@@ -914,9 +958,24 @@ def tg(method, files=None, **params):
         return {}
 
 
-def tg_send(text):
+def tg_send(text, markup=None):
     if TG_ENABLED:
-        tg("sendMessage", chat_id=TG_CHAT, text=text[:4000], disable_web_page_preview=True)
+        extra = {"reply_markup": markup} if markup else {}
+        tg("sendMessage", chat_id=TG_CHAT, text=text[:4000], disable_web_page_preview=True, **extra)
+
+
+# persistent button keyboard at the bottom of the chat; each button sends the command on the right
+MENU_KB = {"keyboard": [
+    [{"text": "📊 Status"}, {"text": "📰 Post now"}],
+    [{"text": "⚙️ Settings"}, {"text": "⏸ Pause"}, {"text": "▶️ Resume"}],
+    [{"text": "🔴 Go LIVE"}, {"text": "🟡 Dry run"}],
+    [{"text": "⚡ Breaking list"}, {"text": "❓ Help"}],
+], "resize_keyboard": True, "is_persistent": True}
+BUTTONS = {
+    "📊 Status": "/status", "📰 Post now": "/post", "⚙️ Settings": "/settings",
+    "⏸ Pause": "/pause", "▶️ Resume": "/resume", "🔴 Go LIVE": "/golive",
+    "🟡 Dry run": "/dryrun", "⚡ Breaking list": "/breaking", "❓ Help": "/help",
+}
 
 
 def tg_send_review(it):
@@ -971,6 +1030,18 @@ def handle_command(text):
         tg_send(settings_text())
     elif cmd == "/breaking":
         tg_send("Breaking keywords (these bypass the scheduled posts/day limit):\n" + ", ".join(breaking_keywords()))
+    elif cmd == "/menu":
+        tg_send("Buttons ready 👇", MENU_KB)
+    elif cmd == "/post":
+        ACTIONS.put(("postnow", None, None))
+    elif cmd == "/say":
+        ACTIONS.put(("say", rest, None)) if rest else tg_send("Usage: /say <your post text>   (posts immediately, max 280 chars)")
+    elif cmd == "/golive":
+        tg("sendMessage", chat_id=TG_CHAT, text="Go LIVE? The bot will post to X for real.",
+           reply_markup={"inline_keyboard": [[{"text": "✅ Yes, go LIVE", "callback_data": "c:live"},
+                                              {"text": "Cancel", "callback_data": "x:live"}]]})
+    elif cmd == "/dryrun":
+        ACTIONS.put(("set", "dry_run", "1"))
     elif cmd == "/set":
         parts = rest.split(None, 1)
         if len(parts) < 2:
@@ -1011,7 +1082,11 @@ def tg_poll():
                     tg("answerCallbackQuery", callback_query_id=cb["id"], text="Working...")
                     tg("editMessageReplyMarkup", chat_id=TG_CHAT, message_id=cb["message"]["message_id"],
                        reply_markup={"inline_keyboard": []})  # remove buttons -> no double taps
-                    if kind == "e":
+                    if kind == "c":
+                        ACTIONS.put(("set", "dry_run", "0"))
+                    elif kind == "x":
+                        tg_send("Cancelled - still in DRY_RUN." if cfg("dry_run") else "Cancelled.")
+                    elif kind == "e":
                         pending_edit = qid
                         tg_send("Send the new post text now (max 280 characters).")
                     else:
@@ -1020,7 +1095,7 @@ def tg_poll():
                 msg = u.get("message")
                 if not msg or not msg.get("text"):
                     continue
-                text = msg["text"].strip()
+                text = BUTTONS.get(msg["text"].strip(), msg["text"].strip())
                 chat = str(msg["chat"]["id"])
                 if text == "/start":  # helps you find your chat id during setup
                     tg("sendMessage", chat_id=chat, text=f"Your chat id: {chat}")
@@ -1053,6 +1128,42 @@ def process_actions():
             kind, qid, extra = ACTIONS.get_nowait()
         except pyqueue.Empty:
             break
+        if kind == "postnow":
+            if killed():
+                tg_send("⏸ Bot is paused - tap Resume first.")
+                continue
+            tg_send("⏳ Looking for a story and writing the post...")
+            try:
+                text = run_post(False, force=True)
+            except Exception as e:
+                log.exception("forced post failed: %s", e)
+                tg_send(f"❌ Post failed: {str(e)[:300]}")
+                continue
+            if text is None:
+                tg_send("😕 No fresh story passed the checks right now. Try again in a few minutes, or use /say your own text.")
+            elif cfg("dry_run"):
+                tg_send("🟡 DRY_RUN is on - nothing was posted. Draft:\n\n" + text)
+            elif not cfg("tg_notify_posts"):
+                tg_send("✅ Posted:\n\n" + text)
+            continue
+        if kind == "say":
+            text = (qid or "").strip()
+            if killed():
+                tg_send("⏸ Bot is paused - tap Resume first.")
+            elif not text or len(text) > 280:
+                tg_send(f"Text must be 1-280 characters (yours: {len(text)}).")
+            else:
+                try:
+                    publish(text, "manual", "news", False, None, kind="forced")
+                except Exception as e:
+                    log.exception("say failed: %s", e)
+                    tg_send(f"❌ Post failed: {str(e)[:300]}")
+                    continue
+                if cfg("dry_run"):
+                    tg_send("🟡 DRY_RUN is on - nothing was posted. Text was:\n\n" + text)
+                elif not cfg("tg_notify_posts"):
+                    tg_send("✅ Posted.")
+            continue
         if kind in SETTING_ACTIONS:
             try:
                 tg_send(apply_setting(kind, qid, extra))
@@ -1121,13 +1232,18 @@ def main():
             {"command": "breaking", "description": "list breaking keywords"},
             {"command": "addbreak", "description": "add breaking keyword"},
             {"command": "delbreak", "description": "remove breaking keyword"},
+            {"command": "post", "description": "post best story now"},
+            {"command": "say", "description": "post your own text now"},
+            {"command": "menu", "description": "show buttons"},
+            {"command": "golive", "description": "go live (asks to confirm)"},
+            {"command": "dryrun", "description": "back to dry-run"},
             {"command": "status", "description": "today's counters"},
             {"command": "pause", "description": "stop all posting"},
             {"command": "resume", "description": "resume posting"},
             {"command": "help", "description": "all commands"},
         ])
         tg_send("🤖 Bot started" + (" (DRY_RUN - nothing will be posted. Go live: /set dry_run 0)" if cfg("dry_run") else " (LIVE)")
-                + "\nSend /help for commands")
+                + "\nSend /help for commands", MENU_KB)
     else:
         log.warning("Telegram not configured: settings cannot be changed, defaults apply (DRY_RUN stays on).")
     apply_schedule()
