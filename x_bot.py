@@ -293,6 +293,10 @@ SOURCES = [
     ("https://www.theverge.com/rss/index.xml", True, "tech"),
 ]
 
+# Google News results from these sources are user posts / ideas, not news - never post them
+BLOCKED_SOURCES = ("tradingview", "reddit", "medium", "substack", "youtube", "facebook",
+                   "telegram", "quora", "stocktwits", "x.com", "twitter")
+
 CAT_KEYWORDS = {
     "news": ["bitcoin", "btc", "crypto", "ethereum", "eth", "solana", "altcoin", "etf", "binance",
              "bitget", "bingx", "bybit", "okx", "coinbase", "hack", "exploit", "stablecoin", "defi"],
@@ -385,23 +389,30 @@ def alert_once(key, text, every_min=180):
 
 
 def ask_claude(system, prompt, max_tokens=300):
-    try:
-        r = claude.messages.create(
-            model=cfg("claude_model"),
-            max_tokens=max_tokens,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
-    except APIStatusError as e:
-        msg = str(e).lower()
-        if e.status_code == 402 or "credit balance" in msg:
-            alert_once("claude_credit", "🚨 Claude API credits are finished - the bot cannot write posts until you add credits:\n"
-                                        "https://platform.claude.com/settings/billing")
-        elif e.status_code == 401:
-            alert_once("claude_auth", "🚨 Claude API key was rejected (invalid or deleted). Create a new key at "
-                                      "https://platform.claude.com and update ANTHROPIC_API_KEY in Railway.")
-        raise
-    return "".join(b.text for b in r.content if b.type == "text").strip()
+    for _attempt in (1, 2):
+        try:
+            r = claude.messages.create(
+                model=cfg("claude_model"),
+                max_tokens=max_tokens,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        except APIStatusError as e:
+            msg = str(e).lower()
+            if e.status_code == 402 or "credit balance" in msg:
+                alert_once("claude_credit", "🚨 Claude API credits are finished - the bot cannot write posts until you add credits:\n"
+                                            "https://platform.claude.com/settings/billing")
+            elif e.status_code == 401:
+                alert_once("claude_auth", "🚨 Claude API key was rejected (invalid or deleted). Create a new key at "
+                                          "https://platform.claude.com and update ANTHROPIC_API_KEY in Railway.")
+            raise
+        text = "".join(b.text for b in r.content if b.type == "text").strip()
+        if text:
+            return text
+        log.warning("Claude returned no text (stop_reason=%s, blocks=%s, max_tokens=%d) - retrying with more room",
+                    r.stop_reason, [b.type for b in r.content], max_tokens)
+        max_tokens = min(max_tokens * 3, 2000)
+    return ""
 
 
 # ---------- NEWS ----------
@@ -461,6 +472,9 @@ def fetch_news():
                 continue
             title = e.title.strip()
             if not trusted:
+                m = re.search(r"\s+-\s+([^-]+)$", title)
+                if m and any(b in m.group(1).lower() for b in BLOCKED_SOURCES):
+                    continue
                 title = re.sub(r"\s+-\s+[^-]+$", "", title)  # strip " - Source"
             summary = re.sub("<[^>]+>", "", e.get("summary", ""))[:300]
             items.append({"title": title, "summary": summary, "age": age, "trusted": trusted, "cat": cat})
@@ -512,6 +526,7 @@ def fetch_x_signals():
             break
         try:
             resp = x.search_recent_tweets(
+                user_auth=True,
                 query=query,
                 max_results=max_results,
                 start_time=start,
@@ -625,6 +640,8 @@ def generate_post(item, breaking):
         "- Max 250 characters total INCLUDING hashtags\n"
         f"- {style}\n"
         "- State only facts from the headline/context, do not invent numbers, dates or details\n"
+        "- NO commentary, warnings, advice, predictions or interpretation: only restate what the headline/context says, "
+        "in your own words\n"
         f"- End with 1-3 relevant hashtags (suggested: {CAT_HASHTAGS[cat]})\n"
         "- No links, no quotes around the post, no preamble\n"
         "Output only the post text."
@@ -702,7 +719,7 @@ def update_metrics():
            if (r["m1"] is None and now - r["t"] >= 3600) or (r["m24"] is None and now - r["t"] >= 86400)]
     if not due:
         return
-    resp = x.get_tweets(ids=[r["id"] for r in due][:100], tweet_fields=["public_metrics"])
+    resp = x.get_tweets(ids=[r["id"] for r in due][:100], tweet_fields=["public_metrics"], user_auth=True)
     metrics = {str(t.id): t.public_metrics for t in (resp.data or [])}
     for r in due:
         m = metrics.get(r["id"])
@@ -801,6 +818,9 @@ def run_post(breaking_only, force=False):
         save_state(state)
 
         text = generate_post(item, breaking)
+        if len(text.strip()) < 30:
+            log.info("SKIP (empty or too short draft): %r", text)
+            continue
         if len(text) > 280:
             text = ask_claude(PERSONA, f"Shorten to under 260 characters, keep hashtags:\n{text}")
         if len(text) > 280:
@@ -883,6 +903,7 @@ def do_replies():
     state = load_state()
     me = get_me()
     resp = x.get_users_mentions(
+        user_auth=True,
         id=me.id,
         since_id=state["since_id"],
         max_results=10,
