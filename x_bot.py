@@ -629,15 +629,26 @@ def quality_check(item, text):
         "- spam_risk: 10 = looks like spam, shilling or a scam promotion\n"
         'Return ONLY JSON: {"usefulness": n, "accuracy": n, "spam_risk": n, "reason": "short"}'
     )
-    raw = ask_claude("You are a strict crypto news editor.", prompt, max_tokens=150)
+    raw = ask_claude("You are a strict crypto news editor. Reply with the JSON object only, no other text.",
+                     prompt, max_tokens=600)
+    s = {}
     m = re.search(r"\{.*\}", raw, re.S)
-    try:
-        s = json.loads(m.group(0))
-        qmin = cfg("quality_min")
-        ok = s["usefulness"] >= qmin and s["accuracy"] >= qmin and s["spam_risk"] <= 4
-        return ok, s
-    except Exception:
+    if m:
+        try:
+            s = json.loads(m.group(0))
+        except Exception:
+            s = {}
+    for k in ("usefulness", "accuracy", "spam_risk"):  # fallback: pull the numbers out of messy output
+        if not isinstance(s.get(k), (int, float)):
+            mm = re.search(r'"?' + k + r'"?\s*[:=]\s*"?(\d+(?:\.\d+)?)', raw)
+            if mm:
+                s[k] = float(mm.group(1))
+    if not all(isinstance(s.get(k), (int, float)) for k in ("usefulness", "accuracy", "spam_risk")):
+        log.warning("quality check unparseable, raw reply: %r", raw[:300])
         return False, {"reason": "unparseable score"}
+    qmin = cfg("quality_min")
+    ok = s["usefulness"] >= qmin and s["accuracy"] >= qmin and s["spam_risk"] <= 4
+    return ok, s
 
 
 def needs_review(cat):
