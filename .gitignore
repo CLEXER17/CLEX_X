@@ -1,0 +1,11 @@
+.env
+state.json
+settings.json
+x_spend.json
+review_queue.json
+posts_log.json
+card.png
+cards/
+STOP
+__pycache__/
+*.pyc

@@ -1,0 +1,7 @@
+tweepy>=4.14
+anthropic>=0.40
+feedparser>=6.0
+requests>=2.31
+schedule>=1.2
+python-dotenv>=1.0
+pillow>=10.1

@@ -1,0 +1,4 @@
+[deploy]
+startCommand = "python x_bot.py"
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 10
