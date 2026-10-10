@@ -36,6 +36,7 @@ Run:
 """
 
 import difflib
+import io
 import json
 import logging
 import os
@@ -50,7 +51,7 @@ import time
 from calendar import timegm
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from urllib.parse import quote
+from urllib.parse import quote, urljoin
 
 import feedparser
 import requests
@@ -95,6 +96,7 @@ SETTINGS = {
     "dry_run": (True, "bool", None, None, "1 = print only, 0 = really post to X"),
     "brand": ("CLEXER", "str", None, None, "name printed on image cards"),
     "use_image": (True, "bool", None, None, "attach image card to posts"),
+    "use_article_image": (True, "bool", None, None, "use the news article's own image when it has one (else the card)"),
     "bold_keywords": (True, "bool", None, None, "bold CAPITAL key words in posts (Unicode bold letters)"),
     "claude_model": ("claude-sonnet-5-5", "str", None, None, "Claude model used for writing/scoring"),
     "max_age_min": (150, "int", 30, 1440, "ignore news older than this (keep > break_check_minutes)"),
@@ -540,6 +542,77 @@ def is_breaking(title):
     return any(re.search(r"\b" + re.escape(k), t) for k in breaking_keywords())
 
 
+_UA = {"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"}
+
+
+def _first_image_url(entry):
+    """Picture URL from an RSS entry (media tags, image enclosure, or the first <img> in its HTML)."""
+    for key in ("media_content", "media_thumbnail"):
+        for m in entry.get(key) or []:
+            if m.get("url"):
+                return m["url"]
+    for ln in entry.get("links") or []:
+        if str(ln.get("type", "")).startswith("image/") and ln.get("href"):
+            return ln["href"]
+    html = (entry["content"][0].get("value", "") if entry.get("content") else "") + entry.get("summary", "")
+    m = re.search(r'<img[^>]+src=["\']([^"\']+)', html, re.I)
+    return m.group(1) if m else ""
+
+
+def page_image_url(url):
+    """og:image / twitter:image of the article page, '' if none."""
+    if not url or "news.google.com" in url:
+        return ""
+    try:
+        r = requests.get(url, timeout=8, headers=_UA)
+        if r.status_code != 200:
+            return ""
+        head = r.text[:200000]
+        for pat in (r'<meta[^>]+(?:property|name)=["\'](?:og:image|twitter:image)["\'][^>]*content=["\']([^"\']+)',
+                    r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\'](?:og:image|twitter:image)["\']'):
+            m = re.search(pat, head, re.I)
+            if m:
+                return urljoin(url, unescape(m.group(1)))
+    except Exception:
+        pass
+    return ""
+
+
+def download_image(img_url, referer=""):
+    """Download, check (>= 400x200) and re-save as a JPEG under X's 5 MB limit. Returns the path or None."""
+    try:
+        r = requests.get(img_url, timeout=10, headers={**_UA, "Referer": referer or ""})
+        if r.status_code != 200 or len(r.content) > 15 * 1024 * 1024:
+            return None
+        img = Image.open(io.BytesIO(r.content))
+        img.load()
+        if img.width < 400 or img.height < 200:   # logos / thumbnails
+            return None
+        img = img.convert("RGB")
+        img.thumbnail((1600, 1600))
+        path = CARDS_DIR / f"art_{int(time.time() * 1000)}.jpg"
+        q = 90
+        while True:
+            img.save(path, "JPEG", quality=q)
+            if path.stat().st_size <= 4_500_000 or q <= 60:
+                break
+            q -= 10
+        return str(path)
+    except Exception as e:
+        log.info("article image skipped (%s): %s", img_url[:80], e)
+        return None
+
+
+def article_image(item):
+    """The news article's own picture, or None (then the generated card is used)."""
+    for u in (item.get("image"), page_image_url(item.get("link"))):
+        if u:
+            path = download_image(u, item.get("link"))
+            if path:
+                return path
+    return None
+
+
 def article_text(url):
     """First paragraphs of the article page, used only as context for the writer. Returns '' on any problem."""
     if not url or "news.google.com" in url:
@@ -577,7 +650,7 @@ def fetch_news():
             body = e["content"][0].get("value", "") if e.get("content") else ""
             summary = re.sub(r"\s+", " ", unescape(re.sub("<[^>]+>", " ", body or e.get("summary", "")))).strip()[:1200]
             items.append({"title": title, "summary": summary, "age": age, "trusted": trusted, "cat": cat,
-                          "link": e.get("link", "")})
+                          "link": e.get("link", ""), "image": _first_image_url(e) if trusted else ""})
     items += fetch_x_signals()
     return items
 
@@ -979,11 +1052,14 @@ def run_post(breaking_only, force=False):
 
         card = None
         if cfg("use_image"):
-            try:
-                card = make_card(item.get("card", item["title"])[:150], cat, breaking,
-                                 out=str(CARDS_DIR / f"{int(time.time())}.png"))
-            except Exception as e:
-                log.warning("Card failed, text only: %s", e)
+            if cfg("use_article_image"):
+                card = article_image(item)
+            if not card:
+                try:
+                    card = make_card(item.get("card", item["title"])[:150], cat, breaking,
+                                     out=str(CARDS_DIR / f"{int(time.time())}.png"))
+                except Exception as e:
+                    log.warning("Card failed, text only: %s", e)
 
         if needs_review(cat) and not force:
             q = load_json(QUEUE_FILE, [])
