@@ -53,6 +53,7 @@ import feedparser
 import requests
 import schedule
 import tweepy
+from requests_oauthlib import OAuth1   # installed together with tweepy
 from anthropic import Anthropic, APIStatusError
 from dotenv import load_dotenv
 from PIL import Image, ImageDraw, ImageFont
@@ -91,6 +92,7 @@ SETTINGS = {
     "dry_run": (True, "bool", None, None, "1 = print only, 0 = really post to X"),
     "brand": ("CLEXER", "str", None, None, "name printed on image cards"),
     "use_image": (True, "bool", None, None, "attach image card to posts"),
+    "bold_keywords": (True, "bool", None, None, "bold CAPITAL key words in posts (Unicode bold letters)"),
     "claude_model": ("claude-sonnet-5-5", "str", None, None, "Claude model used for writing/scoring"),
     "max_age_min": (150, "int", 30, 1440, "ignore news older than this (keep > break_check_minutes)"),
     "break_check_minutes": (120, "int", 5, 720, "how often to look for breaking stories"),
@@ -384,8 +386,61 @@ def roll_day(state):
         state["reg_count"], state["brk_count"] = 0, 0
 
 
+# ---------- TEXT STYLE ----------
+def x_len(text):
+    """Length the way X counts it: emoji and bold-style letters count as 2, most other characters as 1."""
+    n = 0
+    for ch in text:
+        cp = ord(ch)
+        n += 1 if (cp <= 0x10FF or 0x2000 <= cp <= 0x200D or 0x2010 <= cp <= 0x201F or 0x2032 <= cp <= 0x2037) else 2
+    return n
+
+
+def to_bold(s):
+    """A-Z / 0-9 -> Unicode sans-serif bold capitals (this is how 'bold' looks on X; real bold is not possible via API)."""
+    out = []
+    for ch in s.upper():
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D5D4 + ord(ch) - 65))
+        elif "0" <= ch <= "9":
+            out.append(chr(0x1D7EC + ord(ch) - 48))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def from_bold(s):
+    """Reverse of to_bold, so image cards (whose font has no bold-style letters) show normal capitals."""
+    out = []
+    for ch in s:
+        cp = ord(ch)
+        if 0x1D5D4 <= cp <= 0x1D5ED:
+            out.append(chr(65 + cp - 0x1D5D4))
+        elif 0x1D7EC <= cp <= 0x1D7F5:
+            out.append(chr(48 + cp - 0x1D7EC))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def style_text(text):
+    """Turn **KEYWORD** markers from the writer into bold capitals (max 4). Plain text if disabled or too long."""
+    plain = text.replace("**", "")
+    if not cfg("bold_keywords"):
+        return plain
+    count = [0]
+
+    def _bold(m):
+        count[0] += 1
+        return to_bold(m.group(1)) if count[0] <= 4 else m.group(1)
+
+    styled = re.sub(r"\*\*(.+?)\*\*", _bold, text).replace("**", "")
+    return styled if x_len(styled) <= 280 else plain
+
+
 # ---------- CLAUDE ----------
 _alert_last = {}
+_last = {"card": None}   # image card of the most recent run_post draft
 
 
 def alert_once(key, text, every_min=180):
@@ -670,6 +725,9 @@ def generate_post(item, breaking):
         "- NO commentary, warnings, advice, predictions or interpretation: only restate what the headline/context says, "
         "in your own words\n"
         "- Never mention 'the headline', 'the source' or what is missing/unknown - just leave missing details out\n"
+        + ("- Wrap the 1-3 most important key words (company, token, event or key number) in **double asterisks**, "
+           "written in CAPITALS, e.g. **BINANCE** or **$15M**. Never wrap whole sentences or hashtags\n"
+           if cfg("bold_keywords") else "- Do not use asterisks or any markdown\n") +
         "- Name a publication or analyst only if it appears in the headline/context; never write 'according to reports'\n"
         "- Use the concrete numbers, names and dates in the context so the post is specific\n"
         f"- End with 1-3 relevant hashtags (suggested: {CAT_HASHTAGS[cat]})\n"
@@ -777,16 +835,40 @@ def daily_summary():
 
 
 # ---------- PUBLISH ----------
+def upload_card(card_path):
+    """Upload the image card. Tries the v1.1 endpoint (tweepy), then X's v2 upload. Returns a media id or None."""
+    errs = []
+    try:
+        return x_v1.media_upload(filename=card_path).media_id
+    except Exception as e:
+        errs.append(f"v1.1 upload: {str(e)[:200]}")
+    try:
+        auth = OAuth1(os.environ["X_API_KEY"], os.environ["X_API_SECRET"],
+                      os.environ["X_ACCESS_TOKEN"], os.environ["X_ACCESS_TOKEN_SECRET"])
+        with open(card_path, "rb") as f:
+            r = requests.post("https://api.x.com/2/media/upload", auth=auth, files={"media": f},
+                              data={"media_category": "tweet_image"}, timeout=60)
+        if r.ok:
+            j = r.json()
+            mid = (j.get("data") or {}).get("id") or j.get("media_id_string")
+            if mid:
+                return str(mid)
+        errs.append(f"v2 upload: HTTP {r.status_code} {r.text[:200]}")
+    except Exception as e:
+        errs.append(f"v2 upload: {str(e)[:200]}")
+    alert_once("media_fail", "⚠️ Image upload failed - posted TEXT ONLY.\n" + "\n".join(errs), every_min=60)
+    log.warning("Image upload failed: %s", " | ".join(errs))
+    return None
+
+
 def publish(text, title, cat, breaking, card_path, kind="regular"):
     state = load_state()
     roll_day(state)
     dry = cfg("dry_run")
     media_ids = None
     if card_path and not dry:
-        try:
-            media_ids = [x_v1.media_upload(filename=card_path).media_id]
-        except Exception as e:
-            log.warning("Image upload failed, posting text only: %s", e)
+        mid = upload_card(card_path)
+        media_ids = [mid] if mid else None
     log.info("POST [%s%s]: %s", cat, " BREAKING" if breaking else "", text)
     if not dry:
         try:
@@ -853,12 +935,15 @@ def run_post(breaking_only, force=False):
             if extra:
                 item["summary"] = (item["summary"] + " " + extra).strip()[:1800]
         text = generate_post(item, breaking)
+        marked = text                      # keeps **KEYWORD** markers; all checks run on the plain text
+        text = text.replace("**", "")
         if len(text.strip()) < 30:
             log.info("SKIP (empty or too short draft): %r", text)
             continue
-        if len(text) > 280:
+        if x_len(text) > 280:
             text = ask_claude(PERSONA, f"Shorten to under 260 characters, keep hashtags:\n{text}")
-        if len(text) > 280:
+            marked = text = text.replace("**", "")
+        if x_len(text) > 280:
             log.warning("Post too long, skipping")
             continue
         if not numbers_supported(text, item):
@@ -868,7 +953,8 @@ def run_post(breaking_only, force=False):
         if not ok:
             log.info("SKIP (quality %s): %s", scores, text)
             continue
-        if cat in DISCLAIMER_CATS and len(text) + 6 <= 280:
+        text = style_text(marked)          # bold capital key words, applied after all checks
+        if cat in DISCLAIMER_CATS and x_len(text) + 6 <= 280:
             text += "\nDYOR"
 
         card = None
@@ -889,6 +975,7 @@ def run_post(breaking_only, force=False):
             if TG_ENABLED:
                 tg_send_review(q[-1])
             return None
+        _last["card"] = card
         publish(text, item["title"], cat, breaking, card, kind=kind)
         return text
     log.info("No candidate passed the checks this run")
@@ -912,7 +999,7 @@ def review_cli():
             if new:
                 it["text"], a = new, "a"
         if a == "a":
-            if len(it["text"]) > 280:
+            if x_len(it["text"]) > 280:
                 print("Too long (>280), skipped.")
                 keep.append(it)
                 continue
@@ -1022,10 +1109,28 @@ def tg_send(text, markup=None, html=False):
         tg("sendMessage", chat_id=TG_CHAT, text=text[:4000], disable_web_page_preview=True, **extra)
 
 
-def tg_draft_box(text):
-    """Dry-run draft as a monospace '/say ...' box: tap it to copy, send it to post exactly this text once LIVE."""
-    tg_send("🟡 DRY_RUN is on - nothing was posted.\nTap the box to copy, then send it to post exactly this text "
-            "(go LIVE first):\n\n<pre>" + html_escape("/say " + text) + "</pre>", html=True)
+def tg_draft_box(text, card=None):
+    """Dry-run draft (with its image) and a monospace '/say ...' box: tap the box to copy, send it to post this text once LIVE."""
+    body = ("🟡 DRY_RUN is on - nothing was posted.\nTap the box to copy, then send it to post exactly this text "
+            "(go LIVE first):\n\n<pre>" + html_escape("/say " + text) + "</pre>")
+    if card and os.path.exists(card):
+        with open(card, "rb") as f:
+            tg("sendPhoto", files={"photo": f}, chat_id=TG_CHAT, caption=body[:1024], parse_mode="HTML")
+    else:
+        tg_send(body, html=True)
+
+
+def card_for_text(text):
+    """Image card for a /say post: headline = first sentence without hashtags."""
+    if not cfg("use_image"):
+        return None
+    try:
+        head = re.sub(r"#\w+", "", from_bold(text)).replace("\n", " ").strip()
+        head = re.split(r"(?<=[.!?])\s", head)[0][:140] or "Crypto update"
+        return make_card(head, "news", False, out=str(CARDS_DIR / f"{int(time.time())}.png"))
+    except Exception as e:
+        log.warning("Card failed, text only: %s", e)
+        return None
 
 
 # persistent button keyboard at the bottom of the chat; each button sends the command on the right
@@ -1206,7 +1311,7 @@ def process_actions():
             if text is None:
                 tg_send("😕 No fresh story passed the checks right now. Try again in a few minutes, or use /say your own text.")
             elif cfg("dry_run"):
-                tg_draft_box(text)
+                tg_draft_box(text, _last.get("card"))
             elif not cfg("tg_notify_posts"):
                 tg_send("✅ Posted:\n\n" + text)
             continue
@@ -1214,17 +1319,18 @@ def process_actions():
             text = (qid or "").strip()
             if killed():
                 tg_send("⏸ Bot is paused - tap Resume first.")
-            elif not text or len(text) > 280:
-                tg_send(f"Text must be 1-280 characters (yours: {len(text)}).")
+            elif not text or x_len(text) > 280:
+                tg_send(f"Text must be 1-280 characters (yours: {x_len(text)}; emoji and bold letters count double).")
             else:
+                card = card_for_text(text)
                 try:
-                    publish(text, "manual", "news", False, None, kind="forced")
+                    publish(text, "manual", "news", False, card, kind="forced")
                 except Exception as e:
                     log.exception("say failed: %s", e)
                     tg_send(f"❌ Post failed: {str(e)[:300]}")
                     continue
                 if cfg("dry_run"):
-                    tg_draft_box(text)
+                    tg_draft_box(text, card)
                 elif not cfg("tg_notify_posts"):
                     tg_send("✅ Posted.")
             continue
@@ -1244,7 +1350,7 @@ def process_actions():
             QUEUE_FILE.write_text(json.dumps([i for i in q if i["id"] != qid], indent=2))
             tg_send("❌ Rejected.")
         elif kind == "edit":
-            if len(extra) > 280:
+            if x_len(extra) > 280:
                 tg_send(f"Too long ({len(extra)} chars). Original kept:")
             else:
                 it["text"] = extra
