@@ -11,7 +11,7 @@ ENV (Railway Variables) - ONLY these:
     X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_TOKEN_SECRET
     ANTHROPIC_API_KEY
     TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
-    DATA_DIR=/data            (Railway Volume mounted at /data)
+    DATA_DIR=/data            (Railway Volume mounted at /data; the volume path is used automatically when attached)
 
 EVERYTHING ELSE is changed from Telegram (saved in DATA_DIR/settings.json, applied live):
     /settings                 show all settings
@@ -41,7 +41,7 @@ import queue as pyqueue
 import re
 import sys
 import textwrap
-from html import unescape
+from html import escape as html_escape, unescape
 import threading
 import time
 from calendar import timegm
@@ -61,8 +61,16 @@ load_dotenv()
 
 # ---------- ENV (secrets + paths only) ----------
 # DATA_DIR: set to a persistent volume path on Railway (e.g. /data) so state survives redeploys
-DATA_DIR = Path(os.getenv("DATA_DIR", str(Path(__file__).parent)))
+# Railway sets RAILWAY_VOLUME_MOUNT_PATH by itself when a Volume is attached - prefer it, so a wrong DATA_DIR can't lose data
+_vol = os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "")
+DATA_DIR = Path(_vol or os.getenv("DATA_DIR") or str(Path(__file__).parent))
 DATA_DIR.mkdir(parents=True, exist_ok=True)
+PERSISTENT = bool(_vol) or os.path.ismount(str(DATA_DIR))
+STORAGE_NOTE = (
+    f"💾 Settings are saved (volume at {DATA_DIR})" if PERSISTENT else
+    "⚠️ NO PERSISTENT VOLUME - settings, history and pause state reset on every redeploy.\n"
+    "Fix: in Railway open your project, press Ctrl+K, choose Volume, attach it to this service with mount path /data."
+)
 STATE_FILE = DATA_DIR / "state.json"
 CARD_FILE = DATA_DIR / "card.png"
 CARDS_DIR = DATA_DIR / "cards"
@@ -1006,10 +1014,18 @@ def tg(method, files=None, **params):
         return {}
 
 
-def tg_send(text, markup=None):
+def tg_send(text, markup=None, html=False):
     if TG_ENABLED:
         extra = {"reply_markup": markup} if markup else {}
+        if html:
+            extra["parse_mode"] = "HTML"
         tg("sendMessage", chat_id=TG_CHAT, text=text[:4000], disable_web_page_preview=True, **extra)
+
+
+def tg_draft_box(text):
+    """Dry-run draft as a monospace '/say ...' box: tap it to copy, send it to post exactly this text once LIVE."""
+    tg_send("🟡 DRY_RUN is on - nothing was posted.\nTap the box to copy, then send it to post exactly this text "
+            "(go LIVE first):\n\n<pre>" + html_escape("/say " + text) + "</pre>", html=True)
 
 
 # persistent button keyboard at the bottom of the chat; each button sends the command on the right
@@ -1062,8 +1078,8 @@ def status_text():
 
 def handle_command(text):
     """Runs in the poll thread. Read-only commands answer directly; changes go to the main thread."""
-    cmd, _, rest = text.partition(" ")
-    cmd, rest = cmd.split("@")[0].lower(), rest.strip()
+    parts = text.split(None, 1)
+    cmd, rest = parts[0].split("@")[0].lower(), (parts[1].strip() if len(parts) > 1 else "")
     if cmd == "/pause":
         KILL_FILE.touch()
         tg_send("⏸ Paused. Send /resume to continue.")
@@ -1190,7 +1206,7 @@ def process_actions():
             if text is None:
                 tg_send("😕 No fresh story passed the checks right now. Try again in a few minutes, or use /say your own text.")
             elif cfg("dry_run"):
-                tg_send("🟡 DRY_RUN is on - nothing was posted. Draft:\n\n" + text)
+                tg_draft_box(text)
             elif not cfg("tg_notify_posts"):
                 tg_send("✅ Posted:\n\n" + text)
             continue
@@ -1208,7 +1224,7 @@ def process_actions():
                     tg_send(f"❌ Post failed: {str(e)[:300]}")
                     continue
                 if cfg("dry_run"):
-                    tg_send("🟡 DRY_RUN is on - nothing was posted. Text was:\n\n" + text)
+                    tg_draft_box(text)
                 elif not cfg("tg_notify_posts"):
                     tg_send("✅ Posted.")
             continue
@@ -1269,6 +1285,7 @@ def apply_schedule():
 
 
 def main():
+    log.info("Storage: %s | persistent=%s", DATA_DIR, PERSISTENT)
     log.info("Started | dry_run=%s | images=%s | review=%s | telegram=%s", cfg("dry_run"), cfg("use_image"),
              "ALL" if cfg("review_all") else sorted(review_cats()), TG_ENABLED)
     if TG_ENABLED:
@@ -1291,7 +1308,7 @@ def main():
             {"command": "help", "description": "all commands"},
         ])
         tg_send("🤖 Bot started" + (" (DRY_RUN - nothing will be posted. Go live: /set dry_run 0)" if cfg("dry_run") else " (LIVE)")
-                + "\nSend /help for commands", MENU_KB)
+                + "\n" + STORAGE_NOTE + "\nSend /help for commands", MENU_KB)
     else:
         log.warning("Telegram not configured: settings cannot be changed, defaults apply (DRY_RUN stays on).")
     apply_schedule()
