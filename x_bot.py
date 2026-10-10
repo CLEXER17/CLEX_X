@@ -41,6 +41,7 @@ import queue as pyqueue
 import re
 import sys
 import textwrap
+from html import unescape
 import threading
 import time
 from calendar import timegm
@@ -98,7 +99,8 @@ SETTINGS = {
     "x_min_likes": (3, "int", 0, 1000, "total likes across tweets about one $TICKER"),
     "x_min_authors": (2, "int", 1, 50, "distinct accounts mentioning one $TICKER"),
     "x_min_followers": (300, "int", 0, 100000, "ignore tiny/bot-like accounts"),
-    "quality_min": (7, "int", 0, 10, "second Claude pass must score >= this"),
+    "quality_min": (6, "int", 0, 10, "usefulness score needed to post (second Claude pass)"),
+    "accuracy_min": (7, "int", 0, 10, "accuracy score needed (every claim must be in the source)"),
     "review_cats": ("airdrop", "str", None, None, "categories needing your approval (comma list, or none)"),
     "review_all": (False, "bool", None, None, "1 = approve every post yourself"),
     "review_expire_min": (180, "int", 10, 1440, "unreviewed items are dropped after this"),
@@ -457,6 +459,21 @@ def is_breaking(title):
     return any(re.search(r"\b" + re.escape(k), t) for k in breaking_keywords())
 
 
+def article_text(url):
+    """First paragraphs of the article page, used only as context for the writer. Returns '' on any problem."""
+    if not url or "news.google.com" in url:
+        return ""
+    try:
+        r = requests.get(url, timeout=8, headers={"User-Agent": "Mozilla/5.0 (compatible; NewsBot/1.0)"})
+        if r.status_code != 200 or "html" not in r.headers.get("content-type", ""):
+            return ""
+        paras = re.findall(r"<p[^>]*>(.*?)</p>", r.text[:400000], re.S | re.I)
+        txt = " ".join(re.sub("<[^>]+>", " ", p) for p in paras)
+        return re.sub(r"\s+", " ", unescape(txt)).strip()[:1500]
+    except Exception:
+        return ""
+
+
 def fetch_news():
     items = []
     max_age = cfg("max_age_min")
@@ -476,8 +493,10 @@ def fetch_news():
                 if m and any(b in m.group(1).lower() for b in BLOCKED_SOURCES):
                     continue
                 title = re.sub(r"\s+-\s+[^-]+$", "", title)  # strip " - Source"
-            summary = re.sub("<[^>]+>", "", e.get("summary", ""))[:300]
-            items.append({"title": title, "summary": summary, "age": age, "trusted": trusted, "cat": cat})
+            body = e["content"][0].get("value", "") if e.get("content") else ""
+            summary = re.sub(r"\s+", " ", unescape(re.sub("<[^>]+>", " ", body or e.get("summary", "")))).strip()[:1200]
+            items.append({"title": title, "summary": summary, "age": age, "trusted": trusted, "cat": cat,
+                          "link": e.get("link", "")})
     items += fetch_x_signals()
     return items
 
@@ -642,6 +661,9 @@ def generate_post(item, breaking):
         "- State only facts from the headline/context, do not invent numbers, dates or details\n"
         "- NO commentary, warnings, advice, predictions or interpretation: only restate what the headline/context says, "
         "in your own words\n"
+        "- Never mention 'the headline', 'the source' or what is missing/unknown - just leave missing details out\n"
+        "- Name a publication or analyst only if it appears in the headline/context; never write 'according to reports'\n"
+        "- Use the concrete numbers, names and dates in the context so the post is specific\n"
         f"- End with 1-3 relevant hashtags (suggested: {CAT_HASHTAGS[cat]})\n"
         "- No links, no quotes around the post, no preamble\n"
         "Output only the post text."
@@ -672,7 +694,8 @@ def quality_check(item, text):
         f"Source context: {item['summary']}\n\n"
         f"Draft X post:\n{text}\n\n"
         "Score the draft from 0 to 10 on:\n"
-        "- usefulness: clear, specific, worth reading\n"
+        "- usefulness: states a clear, specific, newsworthy fact for a crypto audience (do NOT penalize a post for "
+        "lacking opinion or analysis - none is wanted)\n"
         "- accuracy: every claim is supported by the source; nothing invented\n"
         "- spam_risk: 10 = looks like spam, shilling or a scam promotion\n"
         'Return ONLY JSON: {"usefulness": n, "accuracy": n, "spam_risk": n, "reason": "short"}'
@@ -695,7 +718,7 @@ def quality_check(item, text):
         log.warning("quality check unparseable, raw reply: %r", raw[:300])
         return False, {"reason": "unparseable score"}
     qmin = cfg("quality_min")
-    ok = s["usefulness"] >= qmin and s["accuracy"] >= qmin and s["spam_risk"] <= 4
+    ok = s["usefulness"] >= qmin and s["accuracy"] >= cfg("accuracy_min") and s["spam_risk"] <= 4
     return ok, s
 
 
@@ -808,7 +831,7 @@ def run_post(breaking_only, force=False):
         log.info("No fresh %s item", "breaking" if breaking_only else "")
         return None
     items.sort(key=lambda n: (not is_breaking(n["title"]), CAT_PRIORITY[n["cat"]], n["age"]))
-    for item in items[:3]:   # try the best few candidates; stop at the first one that passes
+    for item in items[:5 if force else 3]:   # try the best few candidates; stop at the first one that passes
         cat = item["cat"]
         breaking = is_breaking(item["title"])
         kind = "forced" if force else ("breaking" if (breaking and not brk_full) else "regular")
@@ -817,6 +840,10 @@ def run_post(breaking_only, force=False):
         state["posted"].append(item["title"])
         save_state(state)
 
+        if len(item["summary"]) < 250 and item.get("link"):
+            extra = article_text(item["link"])
+            if extra:
+                item["summary"] = (item["summary"] + " " + extra).strip()[:1800]
         text = generate_post(item, breaking)
         if len(text.strip()) < 30:
             log.info("SKIP (empty or too short draft): %r", text)
