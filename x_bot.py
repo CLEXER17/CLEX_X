@@ -120,6 +120,7 @@ SETTINGS = {
     "review_all": (False, "bool", None, None, "1 = approve every post yourself"),
     "review_expire_min": (180, "int", 10, 1440, "unreviewed items are dropped after this"),
     "tg_notify_posts": (True, "bool", None, None, "Telegram message for each live post"),
+    "tg_run_reports": (True, "bool", None, None, "Telegram summary after every scheduled run (and busy breaking checks)"),
     "cap_news": (99, "int", 0, 999, "news posts per day (non-breaking)"),
     "cap_airdrop": (2, "int", 0, 999, "airdrop posts per day (non-breaking)"),
     "cap_earnings": (2, "int", 0, 999, "earnings posts per day (non-breaking)"),
@@ -628,6 +629,7 @@ def article_image(item):
         if u:
             path = download_image(u, link)
             if path:
+                item["img_url"] = u        # shown in Telegram so you can check where the picture came from
                 return path
     return None
 
@@ -844,7 +846,8 @@ def generate_post(item, breaking):
         "- No links, no quotes around the post, no preamble\n"
         "Output only the post text."
     )
-    return ask_claude(PERSONA, prompt).strip('"').strip()
+    out = ask_claude(PERSONA, prompt).strip('"').strip()
+    return re.sub(r"\s+#\s*$", "", out)   # never end on a lone '#' 
 
 
 # ---------- SAFETY / QUALITY ----------
@@ -1002,9 +1005,34 @@ def publish(text, title, cat, breaking, card_path, kind="regular"):
     save_state(state)
 
 
+_runs = {"sched": None, "brk": None}   # (time, summary) of the last scheduled run / breaking check
+
+
+def run_report(breaking_only, force, msg, notable):
+    _runs["brk" if breaking_only else "sched"] = (time.time(), msg)
+    if force or not TG_ENABLED or not cfg("tg_run_reports"):
+        return
+    if breaking_only and not notable:   # a quiet breaking check (nothing found) stays silent
+        return
+    tg_send(("⚡ Breaking check: " if breaking_only else "📋 Scheduled run: ") + msg)
+
+
 def run_post(breaking_only, force=False):
     """force=True (/post): ignore daily limits, category caps and review. Returns the post text if one went out."""
+    info = {"msg": "", "notable": False}
+    try:
+        return _run_post(breaking_only, force, info)
+    except Exception as e:
+        info.update(msg=f"❌ failed: {str(e)[:200]}", notable=True)
+        raise
+    finally:
+        if info["msg"]:
+            run_report(breaking_only, force, info["msg"], info["notable"])
+
+
+def _run_post(breaking_only, force, info):
     if killed():
+        info["msg"] = "⏸ paused - nothing done"
         return None
     state = load_state()
     roll_day(state)
@@ -1013,12 +1041,15 @@ def run_post(breaking_only, force=False):
     reg_full = state["reg_count"] >= cfg("posts_per_day")
     if not force and breaking_only and brk_full:
         log.info("Breaking cap reached (%d/day)", brk_cap)
+        info["msg"] = f"breaking cap reached ({brk_cap}/day) - nothing done"
         return None
     if not force and not breaking_only and reg_full:
         log.info("Scheduled posts done for today (%d)", cfg("posts_per_day"))
+        info["msg"] = f"today's {cfg('posts_per_day')} scheduled posts are already done"
         return None
     items = []
-    for n in fetch_news():
+    news = fetch_news()
+    for n in news:
         if not is_niche(n) or is_dup(n["title"], state["posted"]):
             continue
         brk = is_breaking(n["title"])
@@ -1031,8 +1062,11 @@ def run_post(breaking_only, force=False):
         items.append(n)
     if not items:
         log.info("No fresh %s item", "breaking" if breaking_only else "")
+        info["msg"] = (f"{len(news)} fresh stories, none eligible "
+                       "(too old, off-topic, already seen, or over a category cap) - nothing posted")
         return None
     items.sort(key=lambda n: (not is_breaking(n["title"]), CAT_PRIORITY[n["cat"]], n["age"]))
+    skips = []
     for item in items[:5 if force else 3]:   # try the best few candidates; stop at the first one that passes
         cat = item["cat"]
         breaking = is_breaking(item["title"])
@@ -1051,19 +1085,23 @@ def run_post(breaking_only, force=False):
         text = text.replace("**", "")
         if len(text.strip()) < 30:
             log.info("SKIP (empty or too short draft): %r", text)
+            skips.append("empty draft")
             continue
         if x_len(text) > 280:
             text = ask_claude(PERSONA, f"Shorten to under 260 characters, keep hashtags:\n{text}")
             marked = text = text.replace("**", "")
         if x_len(text) > 280:
             log.warning("Post too long, skipping")
+            skips.append("too long")
             continue
         if not numbers_supported(text, item):
             log.info("SKIP (number not in source): %s", text)
+            skips.append("number not in source")
             continue
         ok, scores = quality_check(item, text)
         if not ok:
             log.info("SKIP (quality %s): %s", scores, text)
+            skips.append(f"quality {scores.get('usefulness', '?')}/{scores.get('accuracy', '?')}")
             continue
         text = style_text(marked)          # bold capital key words, applied after all checks
         if cat in DISCLAIMER_CATS and x_len(text) + 6 <= 280:
@@ -1088,16 +1126,22 @@ def run_post(breaking_only, force=False):
             q = load_json(QUEUE_FILE, [])
             q.append({"id": str(int(time.time() * 1000)), "text": text, "title": item["title"],
                       "cat": cat, "breaking": breaking, "card": card, "t": time.time(), "scores": scores,
-                      "kind": kind, "img": img_src})
+                      "kind": kind, "img": img_src,
+                      "link": item.get("real_link") or item.get("link", ""), "img_url": item.get("img_url", "")})
             QUEUE_FILE.write_text(json.dumps(q, indent=2))
             log.info("QUEUED for review [%s]: %s", cat, text)
             if TG_ENABLED:
                 tg_send_review(q[-1])
+            info.update(msg="✍️ draft sent to you for approval", notable=True)
             return None
-        _last.update(card=card, cat=cat, title=item["title"], breaking=breaking, img=img_src)
+        _last.update(card=card, cat=cat, title=item["title"], breaking=breaking, img=img_src,
+                     link=item.get("real_link") or item.get("link", ""), img_url=item.get("img_url", ""))
         publish(text, item["title"], cat, breaking, card, kind=kind)
+        info.update(msg=("🟡 dry-run: draft made, nothing sent to X" if cfg("dry_run") else "✅ posted"), notable=True)
         return text
     log.info("No candidate passed the checks this run")
+    info.update(msg=f"{len(news)} fresh stories, {len(items)} eligible, tried {len(skips)}: none passed "
+                    f"({', '.join(skips)}) - nothing posted", notable=True)
     return None
 
 
@@ -1228,23 +1272,33 @@ def tg_send(text, markup=None, html=False):
         tg("sendMessage", chat_id=TG_CHAT, text=text[:4000], disable_web_page_preview=True, **extra)
 
 
-def enqueue_draft(text, card, title, cat, breaking):
+def enqueue_draft(text, card, title, cat, breaking, link="", img_url=""):
     """Keep a dry-run draft in the review queue so it can be posted later (with its image) after going LIVE."""
     q = load_json(QUEUE_FILE, [])
     it = {"id": str(int(time.time() * 1000)), "text": text, "title": title, "cat": cat, "breaking": breaking,
-          "card": card, "t": time.time(), "scores": {}, "kind": "forced"}
+          "card": card, "t": time.time(), "scores": {}, "kind": "forced", "link": link, "img_url": img_url}
     q.append(it)
     QUEUE_FILE.write_text(json.dumps(q, indent=2))
     return it
 
 
-def tg_draft_box(text, card=None, item=None, img=None):
+def tg_draft_box(text, card=None, item=None, img=None, src=None):
     """Dry-run draft: image + monospace '/say ...' box (tap to copy) + Approve/Edit/Reject buttons that post THIS draft
     (same image, same text) once you are LIVE."""
-    body = ("🟡 DRY_RUN is on - NOT posted yet.\n"
-            + (f"🖼 Image: {img}\n" if img else "") +
-            "To post THIS draft with its image: tap 🔴 Go LIVE, then ✅ Approve below.\n"
-            "Or tap the box to copy it for /say:\n\n<pre>" + html_escape("/say " + text) + "</pre>")
+    def build(with_src):
+        lines = ""
+        if with_src and src:
+            if src.get("img_url"):
+                lines += "🖼 File from: " + html_escape(src["img_url"][:100]) + "\n"
+            if src.get("link"):
+                lines += "🔗 Article: " + html_escape(src["link"][:100]) + "\n"
+        return ("🟡 DRY_RUN is on - NOT posted yet.\n"
+                + (f"🖼 Image: {html_escape(img)}\n" if img else "") + lines +
+                "To post THIS draft with its image: tap 🔴 Go LIVE, then ✅ Approve below.\n"
+                "Or tap the box to copy it for /say:\n\n<pre>" + html_escape("/say " + text) + "</pre>")
+    body = build(True)
+    if len(body) > 1000:   # captions are limited to 1024 characters; never cut inside the <pre> tag
+        body = build(False)
     kb = None
     if item:
         kb = {"inline_keyboard": [[
@@ -1332,7 +1386,10 @@ def tg_send_review(it):
         f"REVIEW [{it['cat']}{' BREAKING' if it['breaking'] else ''}] | "
         f"useful {sc.get('usefulness', '?')} / accurate {sc.get('accuracy', '?')} / spam {sc.get('spam_risk', '?')}\n"
         f"Source: {it['title'][:150]}\n"
-        f"Image: {it.get('img', '?')}\n\n{it['text']}"
+        f"Image: {it.get('img', '?')}\n"
+        + (f"Image file from: {it['img_url'][:110]}\n" if it.get("img_url") else "")
+        + (f"Article: {it['link'][:110]}\n" if it.get("link") else "")
+        + f"\n{it['text']}"
     )
     kb = {"inline_keyboard": [[
         {"text": "✅ Approve", "callback_data": f"a:{it['id']}"},
@@ -1348,6 +1405,28 @@ def tg_send_review(it):
         tg("sendMessage", chat_id=TG_CHAT, text=caption[:4000], reply_markup=kb)
 
 
+def _ago(ts):
+    m = int((time.time() - ts) / 60)
+    return f"{m // 60}h {m % 60}m ago" if m >= 60 else f"{m}m ago"
+
+
+def _in(tag):
+    jobs = schedule.get_jobs(tag)
+    if not jobs or not jobs[0].next_run:
+        return "?"
+    m = max(0, int((jobs[0].next_run - datetime.now()).total_seconds() / 60))
+    return f"{m // 60}h {m % 60}m" if m >= 60 else f"{m}m"
+
+
+def runs_text():
+    out = []
+    for key, label in (("sched", "Last scheduled run"), ("brk", "Last breaking check")):
+        r = _runs[key]
+        out.append(f"{label}: " + (f"{_ago(r[0])} - {r[1]}" if r else "none since the bot started"))
+    out.append(f"Next scheduled run in ~{_in('sched')} | next breaking check in ~{_in('brk')}")
+    return "\n".join(out)
+
+
 def status_text():
     st = load_json(STATE_FILE, {})
     paused = KILL_FILE.exists()
@@ -1357,7 +1436,8 @@ def status_text():
         f"Scheduled today: {st.get('reg_count', 0)}/{cfg('posts_per_day')}\n"
         f"Breaking today: {st.get('brk_count', 0)}/{brk_cap if brk_cap else 'no limit'}\n"
         f"Per category: {st.get('cat_counts', {})}\n"
-        f"Waiting for review: {len(load_json(QUEUE_FILE, []))}"
+        f"Waiting for review: {len(load_json(QUEUE_FILE, []))}\n\n"
+        f"{runs_text()}"
     )
 
 
@@ -1517,8 +1597,9 @@ def process_actions():
             elif cfg("dry_run"):
                 tg_draft_box(text, _last.get("card"),
                              enqueue_draft(text, _last.get("card"), _last.get("title", "manual /post"),
-                                           _last.get("cat", "news"), _last.get("breaking", False)),
-                             img=_last.get("img"))
+                                           _last.get("cat", "news"), _last.get("breaking", False),
+                                           _last.get("link", ""), _last.get("img_url", "")),
+                             img=_last.get("img"), src=_last)
             elif not cfg("tg_notify_posts"):
                 tg_send("✅ Posted:\n\n" + text)
             continue
@@ -1598,10 +1679,10 @@ def apply_schedule():
     """(Re)build the jobs that depend on settings. Called at start and when an interval setting changes."""
     schedule.clear("cfg")
     interval_min = max(60, int(24 * 60 / max(1, cfg("posts_per_day"))))
-    schedule.every(cfg("break_check_minutes")).minutes.do(safe(lambda: run_post(True))).tag("cfg")
+    schedule.every(cfg("break_check_minutes")).minutes.do(safe(lambda: run_post(True))).tag("cfg", "brk")
     # randomized spacing (+/-15%) so posts don't land on a fixed clock
     schedule.every(int(interval_min * 0.85)).to(int(interval_min * 1.15)).minutes.do(
-        safe(lambda: run_post(False))).tag("cfg")
+        safe(lambda: run_post(False))).tag("cfg", "sched")
     schedule.every(cfg("reply_check_minutes")).minutes.do(safe(do_replies)).tag("cfg")
     log.info("Schedule: breaking every %d min | scheduled posts every ~%d min (%d/day)",
              cfg("break_check_minutes"), interval_min, cfg("posts_per_day"))
