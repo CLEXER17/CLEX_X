@@ -603,11 +603,30 @@ def download_image(img_url, referer=""):
         return None
 
 
+def real_link(item):
+    """Publisher URL of a story. Google News links are decoded to the real article URL (best effort, '' on failure)."""
+    if item.get("real_link") is not None:
+        return item["real_link"]
+    link = item.get("link", "")
+    if "news.google.com" in link:
+        try:
+            from googlenewsdecoder import GoogleDecoder
+            with GoogleDecoder(timeout=10) as d:
+                res = d.decode_google_news_url(link)
+            link = res.get("decoded_url", "") if res.get("success") else ""
+        except Exception as e:
+            log.info("Google News link not decoded: %s", e)
+            link = ""
+    item["real_link"] = link
+    return link
+
+
 def article_image(item):
     """The news article's own picture, or None (then the generated card is used)."""
-    for u in (item.get("image"), page_image_url(item.get("link"))):
+    link = real_link(item)
+    for u in (item.get("image"), page_image_url(link)):
         if u:
-            path = download_image(u, item.get("link"))
+            path = download_image(u, link)
             if path:
                 return path
     return None
@@ -1024,7 +1043,7 @@ def run_post(breaking_only, force=False):
         save_state(state)
 
         if len(item["summary"]) < 250 and item.get("link"):
-            extra = article_text(item["link"])
+            extra = article_text(real_link(item))
             if extra:
                 item["summary"] = (item["summary"] + " " + extra).strip()[:1800]
         text = generate_post(item, breaking)
@@ -1050,28 +1069,32 @@ def run_post(breaking_only, force=False):
         if cat in DISCLAIMER_CATS and x_len(text) + 6 <= 280:
             text += "\nDYOR"
 
-        card = None
+        card, img_src = None, "none (images off)"
         if cfg("use_image"):
+            img_src = "generated card"
             if cfg("use_article_image"):
                 card = article_image(item)
+                img_src = "article photo" if card else "generated card (no usable article photo found)"
             if not card:
                 try:
                     card = make_card(item.get("card", item["title"])[:150], cat, breaking,
                                      out=str(CARDS_DIR / f"{int(time.time())}.png"))
                 except Exception as e:
                     log.warning("Card failed, text only: %s", e)
+                    img_src = "none (card failed)"
+        log.info("Image: %s | link=%s", img_src, (item.get("real_link") or item.get("link", ""))[:100])
 
         if needs_review(cat) and not force:
             q = load_json(QUEUE_FILE, [])
             q.append({"id": str(int(time.time() * 1000)), "text": text, "title": item["title"],
                       "cat": cat, "breaking": breaking, "card": card, "t": time.time(), "scores": scores,
-                      "kind": kind})
+                      "kind": kind, "img": img_src})
             QUEUE_FILE.write_text(json.dumps(q, indent=2))
             log.info("QUEUED for review [%s]: %s", cat, text)
             if TG_ENABLED:
                 tg_send_review(q[-1])
             return None
-        _last.update(card=card, cat=cat, title=item["title"], breaking=breaking)
+        _last.update(card=card, cat=cat, title=item["title"], breaking=breaking, img=img_src)
         publish(text, item["title"], cat, breaking, card, kind=kind)
         return text
     log.info("No candidate passed the checks this run")
@@ -1215,10 +1238,11 @@ def enqueue_draft(text, card, title, cat, breaking):
     return it
 
 
-def tg_draft_box(text, card=None, item=None):
+def tg_draft_box(text, card=None, item=None, img=None):
     """Dry-run draft: image + monospace '/say ...' box (tap to copy) + Approve/Edit/Reject buttons that post THIS draft
     (same image, same text) once you are LIVE."""
     body = ("🟡 DRY_RUN is on - NOT posted yet.\n"
+            + (f"🖼 Image: {img}\n" if img else "") +
             "To post THIS draft with its image: tap 🔴 Go LIVE, then ✅ Approve below.\n"
             "Or tap the box to copy it for /say:\n\n<pre>" + html_escape("/say " + text) + "</pre>")
     kb = None
@@ -1307,7 +1331,8 @@ def tg_send_review(it):
     caption = (
         f"REVIEW [{it['cat']}{' BREAKING' if it['breaking'] else ''}] | "
         f"useful {sc.get('usefulness', '?')} / accurate {sc.get('accuracy', '?')} / spam {sc.get('spam_risk', '?')}\n"
-        f"Source: {it['title'][:150]}\n\n{it['text']}"
+        f"Source: {it['title'][:150]}\n"
+        f"Image: {it.get('img', '?')}\n\n{it['text']}"
     )
     kb = {"inline_keyboard": [[
         {"text": "✅ Approve", "callback_data": f"a:{it['id']}"},
@@ -1492,7 +1517,8 @@ def process_actions():
             elif cfg("dry_run"):
                 tg_draft_box(text, _last.get("card"),
                              enqueue_draft(text, _last.get("card"), _last.get("title", "manual /post"),
-                                           _last.get("cat", "news"), _last.get("breaking", False)))
+                                           _last.get("cat", "news"), _last.get("breaking", False)),
+                             img=_last.get("img"))
             elif not cfg("tg_notify_posts"):
                 tg_send("✅ Posted:\n\n" + text)
             continue
