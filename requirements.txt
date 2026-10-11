@@ -5,3 +5,6 @@ requests>=2.31
 schedule>=1.2
 python-dotenv>=1.0
 pillow>=10.1
+googlenewsdecoder>=0.2.1
+selectolax==0.4.13
+httpx[http2]>=0.28.1
